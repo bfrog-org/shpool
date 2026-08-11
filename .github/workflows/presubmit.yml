@@ -16,7 +16,7 @@ jobs:
           inherit-toolchain: true
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install zsh fish
+        run: sudo apt-get update && sudo apt-get install --yes zsh fish
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install fish
@@ -53,7 +53,7 @@ jobs:
         with:
           components: rustfmt
           channel: nightly
-      - run: sudo apt-get install libpam0g-dev
+      - run: sudo apt-get update && sudo apt-get install --yes libpam0g-dev
       - run: cargo +nightly fmt -- --check
 
   cranky:
@@ -66,7 +66,7 @@ jobs:
           components: clippy
           bins: cargo-cranky@0.3.0
           channel: nightly
-      - run: sudo apt-get install zsh fish libpam0g-dev
+      - run: sudo apt-get update && sudo apt-get install --yes zsh fish libpam0g-dev
       - run: cargo +nightly cranky --all-targets -- -D warnings
 
   deny:
@@ -79,5 +79,5 @@ jobs:
         with:
           inherit-toolchain: true
           bins: cargo-deny
-      - run: sudo apt-get install libpam0g-dev
+      - run: sudo apt-get update && sudo apt-get install --yes libpam0g-dev
       - run: cargo deny --all-features check licenses

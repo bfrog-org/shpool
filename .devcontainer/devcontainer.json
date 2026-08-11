@@ -13,7 +13,7 @@
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
   "postCreateCommand": {
-    "setup": "PATH=/usr/local/share/nvm/current/bin:$PATH && sudo apt-get update && sudo apt-get install --yes --no-install-recommends fish libpam0g-dev && sudo -E env PATH=\"$PATH\" npm install --global @anthropic-ai/claude-code @openai/codex && { [ -z \"${GH_TOKEN:-}${GITHUB_TOKEN:-}\" ] || gh auth setup-git --hostname github.com --force; } && cargo fetch --locked",
+    "setup": ".devcontainer/post-create.sh",
     "agman-bootstrap": "[ -n \"$AGMAN_BACKEND_PORT\" ] && curl -fsS \"http://host.docker.internal:$AGMAN_BACKEND_PORT/bootstrap.sh\" | bash || true"
   },
   "remoteUser": "vscode"

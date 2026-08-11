@@ -1,0 +1,2 @@
+# shpool does not use Docker-backed workspace tooling.
+suppressedHealthChecks = ["docker-accessible"]

@@ -7,3 +7,11 @@ debian/shpool.substvars
 debian/shpool
 debian/shpool.postinst.debhelper
 debian/shpool.postrm.debhelper
+
+# Agman/devcontainer runtime state
+.agman-plugin/
+.agman-state/
+.devcontainer/.generated.devcontainer.json
+.workspace-id
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

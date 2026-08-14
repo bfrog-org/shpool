@@ -1,11 +1,81 @@
-use std::{fs, io::Write, process::Command, sync::mpsc, time::Duration};
+use std::{
+    fs,
+    io::Write,
+    path::Path,
+    process::Command,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use ntest::timeout;
 
 mod support;
 
 use crate::support::{daemon::DaemonArgs, tmpdir};
+
+fn wait_for_path(path: &Path, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(anyhow!("timed out waiting for marker file {}", path.display()))
+}
+
+#[test]
+#[timeout(30000)]
+fn stalled_output_client_does_not_wedge_session() -> anyhow::Result<()> {
+    let mut daemon_proc = support::daemon::Proc::new(
+        "restore_many_lines.toml",
+        DaemonArgs { verbosity: 1, ..DaemonArgs::default() },
+    )
+    .context("starting daemon proc")?;
+    let mut attach_a =
+        daemon_proc.attach("stalled", Default::default()).context("starting client A")?;
+
+    let pid_file = daemon_proc.tmp_dir.path().join("durable-shell.pid");
+    let flood_ready_file = daemon_proc.tmp_dir.path().join("flood-ready");
+    let flood_go_file = daemon_proc.tmp_dir.path().join("flood-go");
+    let completion_file = daemon_proc.tmp_dir.path().join("flood-complete");
+    attach_a.run_cmd(&format!("printf '%s\\n' \"$$\" > '{}'", pid_file.display()))?;
+    wait_for_path(&pid_file, Duration::from_secs(1))?;
+    let original_pid = fs::read_to_string(&pid_file)?.trim().to_owned();
+    assert!(!original_pid.is_empty(), "shell PID file was empty");
+
+    attach_a.run_cmd(&format!(
+        // Exceed both the socket capacity and the four-megabyte client buffer.
+        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; i=0; while [ \"$i\" -lt 131072 ]; do printf '%064d\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-SPOOL-MARKER\\n'; : > '{}'",
+        flood_ready_file.display(), flood_go_file.display(), completion_file.display()
+    ))?;
+    wait_for_path(&flood_ready_file, Duration::from_secs(1))?;
+
+    // Leave the socket open while making the entire client unable to drain it.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(attach_a.proc.id() as i32),
+        nix::sys::signal::Signal::SIGSTOP,
+    )?;
+    fs::write(&flood_go_file, [])?;
+
+    // This is the core assertion: the child reached the end of the flood even
+    // though its attached client stopped consuming daemon output.
+    wait_for_path(&completion_file, Duration::from_secs(10))?;
+    daemon_proc.wait_until_list_matches(|output| output.contains("disconnected"))?;
+
+    let mut attach_b =
+        daemon_proc.attach("stalled", Default::default()).context("starting client B")?;
+    let mut output_b = attach_b.line_matcher()?;
+    output_b.scan_until_re("FINAL-SPOOL-MARKER$")?;
+
+    attach_b.run_cmd("echo $$")?;
+    output_b.scan_until_re(&format!("{}$", regex::escape(&original_pid)))?;
+    attach_b.run_cmd("echo transport-recovered")?;
+    output_b.scan_until_re("transport-recovered$")?;
+
+    Ok(())
+}
 
 /// Regression test for a deadlock where the global `shells` mutex is held
 /// during `spawn_subshell` -> `wait_for_startup`. If `wait_for_startup`

@@ -17,7 +17,10 @@ use std::{
     io::{Read, Write},
     net,
     ops::Add,
-    os::unix::net::UnixStream,
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd},
+        unix::net::UnixStream,
+    },
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -27,7 +30,16 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use nix::{poll, poll::PollFlags, sys::signal, unistd::Pid};
+use nix::{
+    errno::Errno,
+    poll,
+    poll::PollFlags,
+    sys::{
+        signal,
+        socket::{self, MsgFlags},
+    },
+    unistd::Pid,
+};
 use parking_lot::Mutex;
 use shpool_protocol::{Attachment, Chunk, ChunkKind, MaybeSwitch, TtySize};
 use tracing::{debug, error, info, instrument, span, trace, warn, Level};
@@ -166,15 +178,122 @@ pub struct SessionInner {
 /// A notification that a new client has connected, sent to the
 /// shell->client thread.
 pub struct ClientConnection {
-    /// All output data should be written to this sink rather than
-    /// directly to the unix stream.
-    sink: io::BufWriter<UnixStream>,
+    sink: ClientSink,
     /// The size of the client tty.
     size: TtySize,
     /// The raw unix socket stream. The shell->client thread should
     /// never write to this directly, just use it for control
     /// operations like shutdown.
     stream: UnixStream,
+}
+
+/// Bounds memory retained for a client that has stopped consuming output.
+const CLIENT_OUTPUT_BUFFER_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+/// A small buffered writer whose socket writes are always nonblocking.
+///
+/// Buffering preserves wire order across partial sends while the worker keeps
+/// draining the PTY. Flush succeeds only once all accepted bytes reach the
+/// socket; WouldBlock tells the caller to wait for POLLOUT and retry.
+#[derive(Debug)]
+struct ClientSink {
+    stream: UnixStream,
+    pending: Vec<u8>,
+    start: usize,
+    failed: bool,
+}
+
+impl ClientSink {
+    fn new(stream: UnixStream) -> Self {
+        Self { stream, pending: Vec::new(), start: 0, failed: false }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.pending.len() - self.start
+    }
+
+    fn wants_pollout(&self) -> bool {
+        self.pending_len() != 0
+    }
+
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+
+    fn fail<T>(&mut self, error: io::Error) -> io::Result<T> {
+        // An error may leave part of a protocol frame pending, so this sink
+        // cannot safely accept another frame.
+        self.failed = true;
+        Err(error)
+    }
+
+    fn try_flush(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::other("client output sink failed"));
+        }
+        while self.wants_pollout() {
+            match send_nonblocking(&self.stream, &self.pending[self.start..]) {
+                Ok(0) => {
+                    return self.fail(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "client socket returned a zero-byte send",
+                    ));
+                }
+                Ok(written) => self.start += written,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                Err(error) => return self.fail(error),
+            }
+        }
+
+        self.pending.clear();
+        self.start = 0;
+        Ok(())
+    }
+
+    fn compact(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        self.pending.copy_within(self.start.., 0);
+        self.pending.truncate(self.pending_len());
+        self.start = 0;
+    }
+}
+
+impl Write for ClientSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.try_flush() {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+
+        if buf.len() > CLIENT_OUTPUT_BUFFER_LIMIT_BYTES.saturating_sub(self.pending_len()) {
+            return self.fail(io::Error::other("client output buffer limit exceeded"));
+        }
+
+        self.compact();
+        self.pending.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.try_flush()
+    }
+}
+
+fn send_nonblocking(stream: &UnixStream, bytes: &[u8]) -> io::Result<usize> {
+    // UnixStream clones share O_NONBLOCK, so set_nonblocking would also change
+    // the client-input reader. MSG_DONTWAIT affects only this send.
+    socket::send(stream.as_raw_fd(), bytes, MsgFlags::MSG_DONTWAIT)
+        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))
 }
 
 #[derive(Debug)]
@@ -222,6 +341,17 @@ fn shutdown_socket(
             Ok(())
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Drop only the attachment and wake its input reader; the PTY and shell live on.
+fn disconnect_output_client(client: &mut ClientConnectionMsg) {
+    if let ClientConnectionMsg::New(conn) =
+        std::mem::replace(client, ClientConnectionMsg::Disconnect)
+    {
+        if let Err(error) = shutdown_socket(&conn.stream, net::Shutdown::Both) {
+            debug!(?error, "shutting down failed output client");
+        }
     }
 }
 
@@ -282,10 +412,6 @@ impl SessionInner {
             let mut output_spool =
                 session_restore::new(config, &args.tty_size, args.scrollback_lines);
             let mut buf: Vec<u8> = vec![0; consts::BUF_SIZE];
-            let mut poll_fds = [poll::PollFd::new(
-                watchable_master.borrow_fd(),
-                PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
-            )];
 
             // block until we get the first connection attached so that we don't drop
             // the initial prompt on the floor
@@ -411,6 +537,7 @@ impl SessionInner {
                         }
                     }
                     recv(args.heartbeat) -> _ => {
+                        let mut reset_client = false;
                         let client_present = if let ClientConnectionMsg::New(conn) = &mut client_conn {
                             let chunk = Chunk { kind: ChunkKind::Heartbeat, buf: &[] };
                             match chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush()) {
@@ -418,18 +545,22 @@ impl SessionInner {
                                     trace!("wrote heartbeat");
                                     true
                                 }
-                                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                                    trace!("client hangup: {:?}", e);
-                                    false
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    trace!("heartbeat buffered");
+                                    true
                                 }
                                 Err(e) => {
-                                    error!("unexpected IO error while writing heartbeat: {}", e);
-                                    return Err(e).context("writing heartbeat")?;
+                                    info!("heartbeat output failed, detaching client: {}", e);
+                                    reset_client = true;
+                                    false
                                 }
                             }
                         } else {
                             false
                         };
+                        if reset_client {
+                            disconnect_output_client(&mut client_conn);
+                        }
 
                         args.heartbeat_ack.send(client_present)
                             .context("sending heartbeat ack")?;
@@ -443,8 +574,8 @@ impl SessionInner {
                             },
                         };
 
-                        let conn = if let ClientConnectionMsg::New(c) = &mut client_conn {
-                            c
+                        let conn = if let ClientConnectionMsg::New(conn) = &mut client_conn {
+                            conn
                         } else {
                             info!("got MaybeSwitch, but no attached client, dropping");
                             continue;
@@ -457,16 +588,18 @@ impl SessionInner {
                         }
 
                         let chunk = Chunk { kind: ChunkKind::MaybeSwitch, buf: &encoded[..] };
-                        match chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush()) {
+                        let write_result =
+                            chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush());
+                        match write_result {
                             Ok(_) => {
                                 trace!("wrote MaybeSwitch");
                             }
-                            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                                trace!("writing MaybeSwitch: client hangup: {:?}", e);
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                trace!("MaybeSwitch buffered");
                             }
                             Err(e) => {
-                                error!("unexpected IO error while writing heartbeat: {}", e);
-                                return Err(e).context("writing MaybeSwitch")?;
+                                info!("MaybeSwitch output failed, detaching client: {}", e);
+                                disconnect_output_client(&mut client_conn);
                             }
                         }
                     }
@@ -498,51 +631,77 @@ impl SessionInner {
                 if do_reattach {
                     info!("executing reattach protocol");
                     let restore_buf = output_spool.restore_buffer();
-                    if let (true, ClientConnectionMsg::New(conn)) =
+                    let restore_result = if let (true, ClientConnectionMsg::New(conn)) =
                         (!restore_buf.is_empty(), &mut client_conn)
                     {
                         trace!("restore chunk='{}'", String::from_utf8_lossy(&restore_buf[..]));
                         // send the restore buffer, broken up into chunks so that we don't make
                         // the client allocate too much
+                        let mut result = Ok(());
                         for block in restore_buf.as_slice().chunks(consts::BUF_SIZE) {
                             let chunk = Chunk { kind: ChunkKind::Data, buf: block };
-
-                            if let Err(err) = chunk.write_to(&mut conn.sink) {
-                                warn!("err writing session-restore buf: {:?}", err);
+                            if let Err(error) = chunk.write_to(&mut conn.sink) {
+                                result = Err(error);
+                                break;
                             }
                         }
-                        if let Err(err) = conn.sink.flush() {
-                            warn!("err flushing session-restore: {:?}", err);
+                        result.and_then(|_| conn.sink.flush())
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = restore_result {
+                        if error.kind() != io::ErrorKind::WouldBlock {
+                            info!("restore output failed, detaching client: {}", error);
+                            disconnect_output_client(&mut client_conn);
                         }
                     }
                 }
 
-                // TODO(ethan): what if poll times out on a tick when we have just
-                // set up a restore chunk? It looks like we will just drop the
-                // data as things are now.
-
-                // Block until the shell has some data for us so we can be sure our reads
-                // always succeed. We don't want to end up blocked forever on a read while
-                // a client is trying to attach.
-                let nready = match poll::poll(&mut poll_fds, SHELL_TO_CLIENT_POLL_MS) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!("polling pty master: {:?}", e);
-                        return Err(e)?;
+                // Always keep draining the PTY; request POLLOUT only when
+                // queued client bytes need to make progress.
+                let mut poll_fds = vec![poll::PollFd::new(
+                    watchable_master.borrow_fd(),
+                    PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+                )];
+                if let ClientConnectionMsg::New(conn) = &client_conn {
+                    if conn.sink.wants_pollout() {
+                        poll_fds.push(poll::PollFd::new(
+                            conn.sink.as_fd(),
+                            PollFlags::POLLOUT | PollFlags::POLLHUP | PollFlags::POLLERR,
+                        ));
                     }
-                };
-                if nready == 0 {
-                    // if timeout
-                    continue;
                 }
-                if nready != 1 {
-                    return Err(anyhow!("shell->client thread: expected exactly 1 ready fd"));
+                match poll::poll(&mut poll_fds, SHELL_TO_CLIENT_POLL_MS) {
+                    Ok(_) => {}
+                    Err(Errno::EINTR) => continue,
+                    Err(error) => return Err(error).context("polling session fds"),
                 }
-                let hangup = poll_fds[0]
-                    .revents()
-                    .map(|r| r.intersects(PollFlags::POLLHUP | PollFlags::POLLERR))
-                    .unwrap_or(false);
-                if hangup {
+                let pty_events = poll_fds[0].revents().unwrap_or_else(PollFlags::empty);
+                let output_events = poll_fds
+                    .get(1)
+                    .and_then(poll::PollFd::revents)
+                    .unwrap_or_else(PollFlags::empty);
+                drop(poll_fds);
+
+                let mut output_failed = output_events
+                    .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL);
+                if output_events.contains(PollFlags::POLLOUT) {
+                    if let ClientConnectionMsg::New(conn) = &mut client_conn {
+                        if let Err(error) = conn.sink.flush() {
+                            if error.kind() != io::ErrorKind::WouldBlock {
+                                info!("client output flush failed, detaching: {}", error);
+                                output_failed = true;
+                            }
+                        }
+                    }
+                }
+                if output_failed {
+                    // Output transport failures belong to this attachment, not
+                    // to the long-lived shell worker.
+                    disconnect_output_client(&mut client_conn);
+                }
+
+                if pty_events.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
                     info!("pty master hung up, exiting shell->client thread");
 
                     // If we have an attached client conn, make a best effort attempt
@@ -555,6 +714,9 @@ impl SessionInner {
                         }
                     }
                     return Ok(());
+                }
+                if !pty_events.contains(PollFlags::POLLIN) {
+                    continue;
                 }
                 let len = match pty_master.read(&mut buf) {
                     Ok(l) => l,
@@ -585,6 +747,8 @@ impl SessionInner {
                 }
 
                 if has_seen_prompt_sentinel {
+                    // Preserve durable session state before attempting delivery
+                    // to a client that may be under backpressure.
                     output_spool.process(buf);
                 }
 
@@ -599,22 +763,26 @@ impl SessionInner {
                     // write the first chunk.
                     if needs_initial_motd_dump {
                         needs_initial_motd_dump = false;
-                        if let Err(e) = daily_messenger.dump(&mut conn.sink, &term_db) {
-                            warn!("Error handling clear: {:?}", e);
+                        if let Err(error) = daily_messenger.dump(&mut conn.sink, &term_db) {
+                            // MOTD generation is optional. A transport error poisons
+                            // the sink and is caught by the live write below.
+                            warn!("Error handling clear: {:?}", error);
                         }
                     }
 
                     let write_result =
                         chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush());
-                    if let Err(err) = write_result {
-                        info!("client_stream write err, assuming hangup: {:?}", err);
-                        reset_client_conn = true;
-                    } else {
-                        test_hooks::emit("daemon-wrote-s2c-chunk");
+                    match write_result {
+                        Ok(()) => test_hooks::emit("daemon-wrote-s2c-chunk"),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(error) => {
+                            info!("client output failed, detaching: {:?}", error);
+                            reset_client_conn = true;
+                        }
                     }
                 }
                 if reset_client_conn {
-                    client_conn = ClientConnectionMsg::Disconnect;
+                    disconnect_output_client(&mut client_conn);
                 }
             }
         };
@@ -630,6 +798,9 @@ impl SessionInner {
         match chunk.write_to(&mut sink).and_then(|_| sink.flush()) {
             Ok(_) => {
                 trace!("wrote exit status chunk");
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                trace!("exit status buffered");
             }
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
                 trace!("client hangup: {:?}", e);
@@ -665,8 +836,9 @@ impl SessionInner {
             client_stream.try_clone().context("creating client->shell client stream")?;
         let shell_to_client_client_stream =
             client_stream.try_clone().context("creating shell->client client stream handle")?;
-        let output_sink =
-            io::BufWriter::new(client_stream.try_clone().context("wrapping stream in bufwriter")?);
+        let output_sink = ClientSink::new(
+            client_stream.try_clone().context("cloning shell->client output stream")?,
+        );
 
         {
             let _s = span!(Level::INFO, "initial_attach_lock(shell_to_client_ctl)").entered();
@@ -1171,6 +1343,51 @@ fn snip_buf(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn client_sink_preserves_order() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut sink = ClientSink::new(stream);
+
+        sink.write_all(b"first").unwrap();
+        sink.write_all(b"-second").unwrap();
+        sink.flush().unwrap();
+
+        let mut received = [0; 12];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"first-second");
+    }
+
+    #[test]
+    fn client_sink_bounds_backpressure() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut sink = ClientSink::new(stream);
+        let fill = [0; consts::BUF_SIZE];
+        loop {
+            match send_nonblocking(&sink.stream, &fill) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("filling socket failed: {error}"),
+            }
+        }
+
+        sink.write_all(&vec![0; CLIENT_OUTPUT_BUFFER_LIMIT_BYTES]).unwrap();
+        assert_eq!(sink.flush().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(sink.write_all(b"overflow").is_err());
+        assert_eq!(sink.pending_len(), CLIENT_OUTPUT_BUFFER_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn client_sink_rejects_writes_after_failure() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut sink = ClientSink::new(stream);
+        drop(peer);
+
+        sink.write_all(b"first").unwrap();
+        assert!(sink.flush().is_err());
+        assert!(sink.write_all(b"second").is_err());
+    }
 
     #[test]
     fn test_snip_buf() {

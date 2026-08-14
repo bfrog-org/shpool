@@ -23,7 +23,8 @@ defaults:
 jobs:
   upload-assets:
     name: ${{ matrix.target }}
-    if: github.repository_owner == 'shell-pool' && startsWith(github.event.release.name, 'shpool')
+    # This branch exists only to package a fork prerelease for soak testing.
+    if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

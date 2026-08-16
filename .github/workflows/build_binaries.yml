@@ -24,13 +24,11 @@ defaults:
 jobs:
   upload-assets:
     name: ${{ matrix.target }}
+    # This branch packages fork builds for integration/soak testing.
     if: |
-      github.repository_owner == 'shell-pool' &&
-      (
-        github.event_name == 'workflow_dispatch' ||
-        startsWith(github.event.release.tag_name, 'v') ||
-        startsWith(github.event.release.name, 'v')
-      )
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.release.tag_name, 'v') ||
+      startsWith(github.event.release.name, 'v')
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
